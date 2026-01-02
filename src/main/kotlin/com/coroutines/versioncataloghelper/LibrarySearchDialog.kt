@@ -8,10 +8,13 @@ import com.intellij.ui.table.JBTable
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.catch
 import java.awt.BorderLayout
+import java.awt.Component
 import java.awt.Dimension
+import java.awt.Font
 import javax.swing.*
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
+import javax.swing.table.DefaultTableCellRenderer
 import javax.swing.table.DefaultTableModel
 
 class LibrarySearchDialog(private val project: Project) : DialogWrapper(project) {
@@ -25,20 +28,58 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
     private val groupLabel = JBLabel()
     private val browser: JBCefBrowser
 
-    private val scopeJob = SupervisorJob()  // Store the job
+    private val loadingLabel = JBLabel()
+
+    private val scopeJob = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.Main + scopeJob)
     private var searchJob: Job? = null
+
+    private var animationTimer: Timer? = null
+    private var animationFrame = 0
+
+    private var currentVendor: String? = null
 
     init {
         title = "Search Maven Repositories"
 
         // Results table
-        resultsModel = DefaultTableModel(
+        resultsModel = object : DefaultTableModel(
             arrayOf("Name", "Latest Version", "Group"),
             0
-        )
+        ) {
+            override fun isCellEditable(row: Int, column: Int) = false
+        }
+
         resultsTable = JBTable(resultsModel).apply {
             setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
+
+            // Custom renderer for group headers
+            setDefaultRenderer(Any::class.java, object : DefaultTableCellRenderer() {
+                override fun getTableCellRendererComponent(
+                    table: JTable?,
+                    value: Any?,
+                    isSelected: Boolean,
+                    hasFocus: Boolean,
+                    row: Int,
+                    column: Int
+                ): Component {
+                    val cell = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
+
+                    // Check if this is a header row
+                    val name = resultsModel.getValueAt(row, 0) as? String ?: ""
+                    if (name.startsWith("━━━")) {
+                        font = font.deriveFont(Font.BOLD, 13f)
+                        background = table?.background?.darker()
+                        foreground = table?.foreground
+                    } else {
+                        font = font.deriveFont(Font.PLAIN, 12f)
+                        background = if (isSelected) table?.selectionBackground else table?.background
+                        foreground = if (isSelected) table?.selectionForeground else table?.foreground
+                    }
+
+                    return cell
+                }
+            })
 
             selectionModel.addListSelectionListener {
                 if (!it.valueIsAdjusting) {
@@ -53,7 +94,6 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
         init()
 
         // Auto-search on typing (with debounce)
-        // Auto-search on typing (with debounce)
         searchField.document.addDocumentListener(object : DocumentListener {
             private var debounceTimer: Timer? = null
 
@@ -62,7 +102,7 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
             override fun changedUpdate(e: DocumentEvent?) = scheduleSearch()
 
             private fun scheduleSearch() {
-                debounceTimer?.stop()  // Changed from cancel()
+                debounceTimer?.stop()
                 debounceTimer = Timer(300) {
                     SwingUtilities.invokeLater {
                         performSearch()
@@ -86,10 +126,14 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
             add(searchField, BorderLayout.CENTER)
         }
 
-        // Left: Results list
-        val resultsPanel = JBScrollPane(resultsTable).apply {
-            preferredSize = Dimension(400, 650)
-        }
+        // Left: Results list with loading indicator at bottom
+        val leftPanel = JPanel(BorderLayout())
+        leftPanel.add(JBScrollPane(resultsTable), BorderLayout.CENTER)
+
+        loadingLabel.horizontalAlignment = SwingConstants.CENTER
+        loadingLabel.border = BorderFactory.createEmptyBorder(10, 10, 10, 10)
+        leftPanel.add(loadingLabel, BorderLayout.SOUTH)
+        leftPanel.preferredSize = Dimension(450, 650)
 
         // Right: Details panel
         val detailsPanel = JPanel().apply {
@@ -124,10 +168,10 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
         // Split pane
         val splitPane = JSplitPane(
             JSplitPane.HORIZONTAL_SPLIT,
-            resultsPanel,
+            leftPanel,
             detailsPanel
         ).apply {
-            dividerLocation = 400
+            dividerLocation = 450
         }
 
         mainPanel.add(searchPanel, BorderLayout.NORTH)
@@ -136,11 +180,32 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
         return mainPanel
     }
 
+    private fun startLoadingAnimation() {
+        stopLoadingAnimation()
+        animationFrame = 0
+        loadingLabel.text = "🔍 Searching..."
+
+        animationTimer = Timer(200) {
+            val dots = ".".repeat((animationFrame % 4))
+            loadingLabel.text = "🔍 Searching$dots"
+            animationFrame++
+        }.apply {
+            start()
+        }
+    }
+
+    private fun stopLoadingAnimation() {
+        animationTimer?.stop()
+        animationTimer = null
+        loadingLabel.text = ""
+    }
+
     private fun performSearch() {
         val keyword = searchField.text.trim()
         if (keyword.length < 5) {
             if (keyword.isEmpty()) {
                 resultsModel.rowCount = 0
+                stopLoadingAnimation()
             }
             return
         }
@@ -148,45 +213,45 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
         // Cancel previous search
         searchJob?.cancel()
 
-        // Clear results and show loading
+        // Clear results and start animation
         resultsModel.rowCount = 0
-        resultsModel.addRow(arrayOf("🔍 Searching...", "", ""))
+        currentVendor = null
+        startLoadingAnimation()
 
-        // Start new search
-        searchJob = scope.launch {
+        // Start new search with streaming results
+        searchJob = scope.launch(Dispatchers.IO) {
             try {
                 KeywordSearch.searchByKeywordFlow(keyword)
                     .catch { e ->
                         println("=== Flow error: ${e.message} ===")
                         e.printStackTrace()
                     }
-                    .collect { library ->
+                    .collect { result ->
                         withContext(Dispatchers.Main) {
-                            // Remove loading indicator if this is first result
-                            if (resultsModel.rowCount > 0 &&
-                                resultsModel.getValueAt(0, 0) == "🔍 Searching...") {
-                                resultsModel.removeRow(0)
+                            // Add vendor header if vendor changed
+                            if (currentVendor != result.vendor) {
+                                currentVendor = result.vendor
+                                resultsModel.addRow(
+                                    arrayOf("━━━ $currentVendor ━━━", "", "")
+                                )
                             }
 
-                            // Add the new result
+                            // Add the library
                             resultsModel.addRow(
                                 arrayOf(
-                                    library.artifactId,
-                                    library.latestVersion,
-                                    library.groupId
+                                    result.library.artifactId,
+                                    result.library.latestVersion,
+                                    result.library.groupId
                                 )
                             )
 
-                            println("=== Added to UI: ${library.groupId}:${library.artifactId} ===")
+                            println("=== Added: ${result.library.groupId}:${result.library.artifactId} ===")
                         }
                     }
 
-                // After all results, remove loading indicator if still there
+                // Search complete
                 withContext(Dispatchers.Main) {
-                    if (resultsModel.rowCount > 0 &&
-                        resultsModel.getValueAt(0, 0) == "🔍 Searching...") {
-                        resultsModel.removeRow(0)
-                    }
+                    stopLoadingAnimation()
 
                     if (resultsModel.rowCount == 0) {
                         resultsModel.addRow(arrayOf("No results found", "", ""))
@@ -195,11 +260,15 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
 
             } catch (e: CancellationException) {
                 println("=== Search cancelled ===")
+                withContext(Dispatchers.Main) {
+                    stopLoadingAnimation()
+                }
             } catch (e: Exception) {
                 println("=== Search error: ${e.message} ===")
                 e.printStackTrace()
 
                 withContext(Dispatchers.Main) {
+                    stopLoadingAnimation()
                     resultsModel.rowCount = 0
                     resultsModel.addRow(arrayOf("Error: ${e.message}", "", ""))
                 }
@@ -215,8 +284,8 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
         val version = resultsModel.getValueAt(selectedRow, 1) as String
         val group = resultsModel.getValueAt(selectedRow, 2) as String
 
-        // Skip special rows
-        if (name.startsWith("🔍") || name == "No results found" || name.startsWith("Error:")) {
+        // Skip special rows (headers, no results, errors)
+        if (name.startsWith("━━━") || name == "No results found" || name.startsWith("Error:")) {
             return
         }
 
@@ -422,7 +491,7 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
         val groupId = resultsModel.getValueAt(selectedRow, 2) as String
 
         // Skip special rows
-        if (artifactId.startsWith("🔍") || artifactId == "No results found" || artifactId.startsWith("Error:")) {
+        if (artifactId.startsWith("━━━") || artifactId == "No results found" || artifactId.startsWith("Error:")) {
             return
         }
 
@@ -448,6 +517,7 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
 
     override fun dispose() {
         searchJob?.cancel()
+        stopLoadingAnimation()
         scope.coroutineContext.cancelChildren()
         browser.dispose()
         super.dispose()
