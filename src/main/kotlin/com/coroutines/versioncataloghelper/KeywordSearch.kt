@@ -1,5 +1,9 @@
 package com.coroutines.versioncataloghelper
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
@@ -14,125 +18,128 @@ object KeywordSearch {
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    fun searchByKeyword(keyword: String): List<MavenCentralApi.LibraryInfo> {
-        if (keyword.length < 2) {
-            println("=== Keyword too short: $keyword ===")
-            return emptyList()
+    fun searchByKeywordFlow(keyword: String): Flow<MavenCentralApi.LibraryInfo> = flow {
+        if (keyword.length < 3) {
+            return@flow
         }
 
         println("=== SEARCHING for keyword: $keyword ===")
 
-        val allLibraries = mutableListOf<MavenCentralApi.LibraryInfo>()
+        val emittedIds = mutableSetOf<String>()
 
-        // 1. Search Google Maven with common patterns
-        val googleResults = searchGoogleMaven(keyword)
-        println("=== Found ${googleResults.size} results from Google Maven ===")
-        allLibraries.addAll(googleResults)
+        // 1. Search Google Maven and emit results immediately as we find them
+        val patterns = buildGoogleMavenPatterns(keyword)
 
-        // 2. Search Maven Central
-        val mavenResults = searchMavenCentral(keyword)
-        println("=== Found ${mavenResults.size} results from Maven Central ===")
-        allLibraries.addAll(mavenResults)
+        for ((groupId, artifactId) in patterns) {
+            val lib = tryFetchGoogleMaven(groupId, artifactId)
+            if (lib != null) {
+                val id = "${lib.groupId}:${lib.artifactId}"
+                if (!emittedIds.contains(id)) {
+                    emittedIds.add(id)
+                    emit(lib)  // Emit immediately!
+                    println("=== Emitted: $id ===")
+                }
+            }
+        }
 
-        // 3. Prioritize, deduplicate, and group
-        return prioritizeAndGroup(allLibraries, keyword)
+        // 2. Search Maven Central and emit as we find them
+        val mavenResults = withContext(Dispatchers.IO) {
+            searchMavenCentral(keyword)
+        }
+
+        val scored = mavenResults.map { lib ->
+            lib to calculateRelevanceScore(lib, keyword)
+        }.sortedByDescending { it.second }
+
+        scored.forEach { (lib, score) ->
+            val id = "${lib.groupId}:${lib.artifactId}"
+            if (!emittedIds.contains(id)) {
+                emittedIds.add(id)
+                emit(lib)  // Emit immediately!
+                println("=== Emitted: $id (score: $score) ===")
+            }
+        }
     }
 
-    private fun searchGoogleMaven(keyword: String): List<MavenCentralApi.LibraryInfo> {
-        val results = mutableListOf<MavenCentralApi.LibraryInfo>()
-
-        // Smart patterns - try multiple common AndroidX/Google library patterns
+    private fun buildGoogleMavenPatterns(keyword: String): List<Pair<String, String>> {
         val patterns = mutableListOf<Pair<String, String>>()
 
-        // Pattern 1: androidx.{keyword} (most common!)
         patterns.add("androidx.$keyword" to keyword)
-
-        // Pattern 2: androidx.{keyword}.{keyword} (e.g., androidx.lifecycle.lifecycle-runtime)
         patterns.add("androidx.$keyword" to "$keyword-runtime")
+        patterns.add("androidx.$keyword" to "$keyword-ktx")
+        patterns.add("androidx.$keyword" to "$keyword-runtime-ktx")
         patterns.add("androidx.$keyword" to "$keyword-viewmodel")
         patterns.add("androidx.$keyword" to "$keyword-livedata")
         patterns.add("androidx.$keyword" to "$keyword-common")
-
-        // Pattern 3: androidx.compose.{keyword}
         patterns.add("androidx.compose.$keyword" to keyword)
         patterns.add("androidx.compose.$keyword" to "$keyword-android")
-
-        // Pattern 4: com.google.android.{keyword}
         patterns.add("com.google.android.$keyword" to keyword)
-
-        // Pattern 5: com.google.{keyword}
         patterns.add("com.google.$keyword" to keyword)
 
-        // Pattern 6: Common library name variations
         when (keyword.lowercase()) {
             "lifecycle" -> {
-                patterns.add("androidx.lifecycle" to "lifecycle-runtime-ktx")
-                patterns.add("androidx.lifecycle" to "lifecycle-viewmodel-ktx")
-                patterns.add("androidx.lifecycle" to "lifecycle-livedata-ktx")
+                patterns.add(0, "androidx.lifecycle" to "lifecycle-runtime-ktx")
+                patterns.add(1, "androidx.lifecycle" to "lifecycle-viewmodel-ktx")
+                patterns.add(2, "androidx.lifecycle" to "lifecycle-livedata-ktx")
             }
             "room" -> {
-                patterns.add("androidx.room" to "room-runtime")
-                patterns.add("androidx.room" to "room-ktx")
+                patterns.add(0, "androidx.room" to "room-runtime")
+                patterns.add(1, "androidx.room" to "room-ktx")
             }
             "navigation" -> {
-                patterns.add("androidx.navigation" to "navigation-fragment-ktx")
-                patterns.add("androidx.navigation" to "navigation-ui-ktx")
+                patterns.add(0, "androidx.navigation" to "navigation-fragment-ktx")
+                patterns.add(1, "androidx.navigation" to "navigation-ui-ktx")
             }
             "compose" -> {
-                patterns.add("androidx.compose.ui" to "ui")
-                patterns.add("androidx.compose.material3" to "material3")
-                patterns.add("androidx.compose.runtime" to "runtime")
+                patterns.add(0, "androidx.compose.ui" to "ui")
+                patterns.add(1, "androidx.compose.material3" to "material3")
+                patterns.add(2, "androidx.compose.runtime" to "runtime")
             }
             "glance" -> {
-                patterns.add("androidx.glance" to "glance")
-                patterns.add("androidx.glance" to "glance-appwidget")
+                patterns.add(0, "androidx.glance" to "glance")
+                patterns.add(1, "androidx.glance" to "glance-appwidget")
             }
         }
 
-        // Try each pattern
-        for ((groupId, artifactId) in patterns) {
-            try {
-                val groupPath = groupId.replace('.', '/')
-                val url = "https://dl.google.com/android/maven2/$groupPath/$artifactId/maven-metadata.xml"
+        return patterns
+    }
 
-                val request = Request.Builder().url(url).build()
-                val response = client.newCall(request).execute()
+    private fun tryFetchGoogleMaven(groupId: String, artifactId: String): MavenCentralApi.LibraryInfo? {
+        try {
+            val groupPath = groupId.replace('.', '/')
+            val url = "https://dl.google.com/android/maven2/$groupPath/$artifactId/maven-metadata.xml"
 
-                response.use {
-                    if (it.isSuccessful) {
-                        val body = it.body?.string() ?: return@use
-                        val latestVersion = extractLatestVersion(body)
+            val request = Request.Builder().url(url).build()
+            val response = client.newCall(request).execute()
 
-                        if (latestVersion != null) {
-                            println("=== FOUND on Google Maven: $groupId:$artifactId - $latestVersion ===")
+            response.use {
+                if (it.isSuccessful) {
+                    val body = it.body?.string() ?: return null
+                    val latestVersion = extractLatestVersion(body)
 
-                            results.add(
-                                MavenCentralApi.LibraryInfo(
-                                    groupId = groupId,
-                                    artifactId = artifactId,
-                                    latestVersion = latestVersion
-                                )
-                            )
-                        }
+                    if (latestVersion != null) {
+                        println("=== FOUND on Google Maven: $groupId:$artifactId - $latestVersion ===")
+                        return MavenCentralApi.LibraryInfo(
+                            groupId = groupId,
+                            artifactId = artifactId,
+                            latestVersion = latestVersion
+                        )
                     }
                 }
-            } catch (e: Exception) {
-                // Silent fail - try next pattern
             }
+        } catch (e: Exception) {
+            // Silent fail
         }
-
-        return results
+        return null
     }
 
     private fun extractLatestVersion(xml: String): String? {
-        // Try <latest> first
         var pattern = """<latest>([^<]+)</latest>""".toRegex()
         var match = pattern.find(xml)
         if (match != null) {
             return match.groupValues[1]
         }
 
-        // Fallback: try <release>
         pattern = """<release>([^<]+)</release>""".toRegex()
         match = pattern.find(xml)
         return match?.groupValues?.get(1)
@@ -141,10 +148,8 @@ object KeywordSearch {
     private fun searchMavenCentral(keyword: String): List<MavenCentralApi.LibraryInfo> {
         val results = mutableListOf<MavenCentralApi.LibraryInfo>()
 
-        // Search 1: Exact keyword
         results.addAll(searchMavenCentralWithQuery(keyword))
 
-        // Search 2: With "androidx." prefix (in case user forgot to type it)
         if (!keyword.startsWith("androidx.") && !keyword.startsWith("com.google.")) {
             results.addAll(searchMavenCentralWithQuery("androidx.$keyword"))
             results.addAll(searchMavenCentralWithQuery("com.google.android.$keyword"))
@@ -158,8 +163,6 @@ object KeywordSearch {
             val url = "https://search.maven.org/solrsearch/select?" +
                     "q=$query&" +
                     "rows=20&wt=json"
-
-            println("=== Maven Central query: $query ===")
 
             val request = Request.Builder().url(url).build()
             val response = client.newCall(request).execute()
@@ -182,80 +185,26 @@ object KeywordSearch {
         }
     }
 
-    private fun prioritizeAndGroup(
-        libraries: List<MavenCentralApi.LibraryInfo>,
-        keyword: String
-    ): List<MavenCentralApi.LibraryInfo> {
-        // Remove duplicates (same group:artifact)
-        val unique = libraries.distinctBy { "${it.groupId}:${it.artifactId}" }
-
-        println("=== After deduplication: ${unique.size} unique libraries ===")
-
-        // Score each library for relevance
-        val scored = unique.map { lib ->
-            val score = calculateRelevanceScore(lib, keyword)
-            lib to score
-        }.sortedByDescending { it.second }
-
-        // Group by vendor
-        val grouped = scored.groupBy { (lib, _) ->
-            when {
-                lib.groupId.startsWith("androidx.") -> 0 // AndroidX first
-                lib.groupId.startsWith("com.google.android.") -> 1 // Google second
-                lib.groupId.startsWith("com.google.") -> 2 // Other Google third
-                lib.groupId.startsWith("org.jetbrains.") ||
-                        lib.groupId.startsWith("com.jetbrains.") -> 3 // JetBrains fourth
-                else -> 4 // Others last
-            }
-        }
-
-        // Flatten in priority order
-        val result = mutableListOf<MavenCentralApi.LibraryInfo>()
-        for (priority in 0..4) {
-            grouped[priority]?.let { libs ->
-                result.addAll(libs.map { it.first })
-            }
-        }
-
-        println("=== Final results: ${result.size} libraries ===")
-        result.take(15).forEach {
-            println("  -> ${it.groupId}:${it.artifactId} - ${it.latestVersion}")
-        }
-
-        // Limit to top 15
-        return result.take(15)
-    }
-
     private fun calculateRelevanceScore(lib: MavenCentralApi.LibraryInfo, keyword: String): Int {
         var score = 0
         val keywordLower = keyword.lowercase()
         val groupLower = lib.groupId.lowercase()
         val artifactLower = lib.artifactId.lowercase()
 
-        // Exact artifact match
         if (artifactLower == keywordLower) score += 100
-
-        // Artifact starts with keyword
         if (artifactLower.startsWith(keywordLower)) score += 50
-
-        // Artifact contains keyword
         if (artifactLower.contains(keywordLower)) score += 25
-
-        // Group contains keyword (e.g., androidx.lifecycle)
         if (groupLower.contains(keywordLower)) score += 20
 
-        // Exact group.keyword match (e.g., searching "lifecycle" finds "androidx.lifecycle")
         if (groupLower == "androidx.$keywordLower" ||
             groupLower == "com.google.$keywordLower" ||
             groupLower == "com.google.android.$keywordLower") {
             score += 150
         }
 
-        // Bonus for AndroidX/Google (already prioritized, but this helps ranking within category)
         if (groupLower.startsWith("androidx.")) score += 30
         if (groupLower.startsWith("com.google.")) score += 20
 
-        // Penalty for very long artifact names (likely not what user wants)
         if (artifactLower.length > keywordLower.length + 20) score -= 10
 
         return score

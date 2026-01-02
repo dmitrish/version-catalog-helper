@@ -3,7 +3,6 @@ package com.coroutines.versioncataloghelper
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.jsoup.Jsoup
-import org.jsoup.safety.Safelist
 import java.util.concurrent.TimeUnit
 
 object LibraryMetadataFetcher {
@@ -22,12 +21,10 @@ object LibraryMetadataFetcher {
     fun fetchMetadata(groupId: String, artifactId: String, version: String): LibraryMetadata {
         println("=== Fetching metadata for $groupId:$artifactId:$version ===")
 
-        // Try to get POM file first
         val pomUrl = getPomUrl(groupId, artifactId, version)
         val (url, description) = parsePom(pomUrl)
 
-        // If URL exists, fetch its content
-        val htmlContent = url?.let { fetchHtmlContent(it, groupId, artifactId, version) }
+        val htmlContent = url?.let { fetchAndFormatHtml(it, groupId, artifactId, version) }
 
         return LibraryMetadata(url, description, htmlContent)
     }
@@ -35,7 +32,6 @@ object LibraryMetadataFetcher {
     private fun getPomUrl(groupId: String, artifactId: String, version: String): String {
         val groupPath = groupId.replace('.', '/')
 
-        // Try Google Maven first for androidx/google libraries
         return if (groupId.startsWith("androidx.") || groupId.startsWith("com.google.")) {
             "https://dl.google.com/android/maven2/$groupPath/$artifactId/$version/$artifactId-$version.pom"
         } else {
@@ -51,23 +47,17 @@ object LibraryMetadataFetcher {
             val response = client.newCall(request).execute()
 
             response.use {
-                if (!it.isSuccessful) {
-                    println("=== POM fetch failed: ${it.code} ===")
-                    return null to null
-                }
+                if (!it.isSuccessful) return null to null
 
                 val pomXml = it.body?.string() ?: return null to null
 
-                // Extract URL
                 val urlPattern = """<url>([^<]+)</url>""".toRegex()
                 val url = urlPattern.find(pomXml)?.groupValues?.get(1)
 
-                // Extract description
                 val descPattern = """<description>([^<]+)</description>""".toRegex()
                 val description = descPattern.find(pomXml)?.groupValues?.get(1)
 
                 println("=== Found URL: $url ===")
-                println("=== Found description: $description ===")
 
                 return url to description
             }
@@ -77,151 +67,331 @@ object LibraryMetadataFetcher {
         }
     }
 
-    private fun fetchHtmlContent(url: String, groupId: String, artifactId: String, version: String): String? {
+    private fun fetchAndFormatHtml(url: String, groupId: String, artifactId: String, version: String): String {
         try {
-            // Special handling for AndroidX libraries
             val finalUrl = if (groupId.startsWith("androidx.")) {
-                constructAndroidXUrl(groupId, artifactId, version, url)
+                val library = groupId.removePrefix("androidx.")
+                "https://developer.android.com/jetpack/androidx/releases/$library#$version"
             } else {
                 url
             }
 
-            println("=== Fetching HTML from: $finalUrl ===")
+            println("=== Fetching from: $finalUrl ===")
 
             val request = Request.Builder().url(finalUrl).build()
             val response = client.newCall(request).execute()
 
             response.use {
-                if (!it.isSuccessful) {
-                    println("=== HTML fetch failed: ${it.code} ===")
-                    return null
+                if (!it.isSuccessful) return buildErrorHtml(finalUrl)
+
+                val html = it.body?.string() ?: return buildErrorHtml(finalUrl)
+
+                return if (finalUrl.contains("developer.android.com")) {
+                    extractAndFormatAndroidX(html, finalUrl, version)
+                } else {
+                    // For other URLs, return a styled iframe
+                    buildIframeHtml(finalUrl)
                 }
-
-                val html = it.body?.string() ?: return null
-
-                // Parse and extract relevant content
-                return extractRelevantContent(html, finalUrl)
             }
         } catch (e: Exception) {
-            println("=== Error fetching HTML: ${e.message} ===")
-            return null
+            println("=== Error: ${e.message} ===")
+            return buildErrorHtml(url)
         }
     }
 
-    private fun constructAndroidXUrl(groupId: String, artifactId: String, version: String, baseUrl: String): String {
-        // For AndroidX, construct release notes URL
-        // Example: androidx.lifecycle → https://developer.android.com/jetpack/androidx/releases/lifecycle
-
-        val library = groupId.removePrefix("androidx.")
-        val versionMajorMinor = version.split(".").take(2).joinToString(".")
-
-        return "https://developer.android.com/jetpack/androidx/releases/$library#$version"
-    }
-
-    private fun extractRelevantContent(html: String, url: String): String {
+    private fun extractAndFormatAndroidX(html: String, url: String, version: String): String {
         try {
             val doc = Jsoup.parse(html, url)
 
-            // For AndroidX documentation, extract the main content
-            if (url.contains("developer.android.com")) {
-                return extractAndroidXContent(doc, url)
+            // Find version section
+            val versionHeader = doc.select("h2, h3, h4").find {
+                it.text().contains(version, ignoreCase = true) ||
+                        it.attr("id").contains(version, ignoreCase = true)
             }
 
-            // For other sites, try to find main content
-            val mainContent = doc.select("article, main, .content, #content").firstOrNull()
-                ?: doc.body()
+            val content = StringBuilder()
 
-            // Clean up and format
-            val cleaned = Jsoup.clean(
-                mainContent.html(),
-                url,
-                Safelist.relaxed()
-                    .addTags("h1", "h2", "h3", "h4", "h5", "h6")
-                    .addAttributes("a", "href")
-            )
-
-            return """
-                <html>
-                <head>
-                    <style>
-                        body { font-family: sans-serif; padding: 10px; }
-                        h1, h2, h3 { color: #1a73e8; }
-                        a { color: #1a73e8; }
-                        code { background: #f5f5f5; padding: 2px 4px; }
-                        pre { background: #f5f5f5; padding: 10px; }
-                    </style>
-                </head>
-                <body>
-                    <p><b>Source:</b> <a href="$url">$url</a></p>
-                    <hr>
-                    $cleaned
-                </body>
-                </html>
-            """.trimIndent()
-        } catch (e: Exception) {
-            println("=== Error extracting content: ${e.message} ===")
-            return "<html><body><p>Error loading content: ${e.message}</p></body></html>"
-        }
-    }
-
-    private fun extractAndroidXContent(doc: org.jsoup.nodes.Document, url: String): String {
-        try {
-            // Try to find the specific version section
-            val versionHash = url.substringAfter("#", "")
-
-            // Look for the version header
-            val versionHeader = if (versionHash.isNotEmpty()) {
-                doc.select("h2, h3").find { it.text().contains(versionHash) }
-            } else {
-                null
-            }
-
-            // Extract content between this header and the next one
-            val content = if (versionHeader != null) {
-                val siblings = mutableListOf<String>()
-                siblings.add("<h2>${versionHeader.text()}</h2>")
+            if (versionHeader != null) {
+                content.append("<h2>${versionHeader.text()}</h2>")
 
                 var next = versionHeader.nextElementSibling()
                 while (next != null && next.tagName() !in listOf("h1", "h2")) {
-                    siblings.add(next.outerHtml())
+                    when (next.tagName()) {
+                        "p" -> content.append("<p>${next.html()}</p>")
+                        "ul", "ol" -> {
+                            content.append("<ul>")
+                            next.select("li").forEach {
+                                content.append("<li>${it.html()}</li>")
+                            }
+                            content.append("</ul>")
+                        }
+                        "h3" -> content.append("<h3>${next.text()}</h3>")
+                        "h4" -> content.append("<h4>${next.text()}</h4>")
+                        "pre" -> content.append("<pre><code>${next.text()}</code></pre>")
+                        "table" -> content.append(next.outerHtml())
+                        else -> {
+                            if (next.text().isNotBlank()) {
+                                content.append("<p>${next.html()}</p>")
+                            }
+                        }
+                    }
                     next = next.nextElementSibling()
+                    if (content.length > 20000) break
                 }
-
-                siblings.joinToString("\n")
             } else {
-                // Fall back to main content area
-                doc.select("article, main").firstOrNull()?.html()
-                    ?: doc.select(".devsite-article-body").firstOrNull()?.html()
-                    ?: "Content not found"
+                // Fallback: get first relevant content
+                content.append("<p><em>Version-specific notes not found. Showing general information:</em></p>")
+                doc.select("article p, main p, .devsite-article-body p").take(10).forEach {
+                    content.append("<p>${it.html()}</p>")
+                }
             }
 
             return """
+                <!DOCTYPE html>
                 <html>
                 <head>
+                    <meta charset="UTF-8">
                     <style>
-                        body { font-family: Roboto, sans-serif; padding: 15px; font-size: 14px; }
-                        h1, h2, h3 { color: #1a73e8; margin-top: 20px; }
-                        h2 { font-size: 18px; }
-                        h3 { font-size: 16px; }
-                        a { color: #1a73e8; text-decoration: none; }
-                        a:hover { text-decoration: underline; }
-                        code { background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-family: monospace; }
-                        pre { background: #f5f5f5; padding: 12px; border-radius: 4px; overflow-x: auto; }
-                        ul, ol { padding-left: 20px; }
-                        li { margin: 8px 0; }
+                        * {
+                            margin: 0;
+                            padding: 0;
+                            box-sizing: border-box;
+                        }
+                        
+                        body {
+                            font-family: 'Roboto', 'Segoe UI', Arial, sans-serif;
+                            background: #ffffff;
+                            color: #202124;
+                            padding: 24px;
+                            line-height: 1.6;
+                        }
+                        
+                        .source-link {
+                            background: #e8f0fe;
+                            padding: 12px 16px;
+                            border-radius: 8px;
+                            margin-bottom: 24px;
+                            border-left: 4px solid #1a73e8;
+                        }
+                        
+                        .source-link a {
+                            color: #1a73e8;
+                            text-decoration: none;
+                            font-weight: 500;
+                        }
+                        
+                        .source-link a:hover {
+                            text-decoration: underline;
+                        }
+                        
+                        .content {
+                            background: #ffffff;
+                            max-width: 800px;
+                        }
+                        
+                        h2 {
+                            color: #1a73e8;
+                            font-size: 28px;
+                            margin: 24px 0 16px 0;
+                            font-weight: 500;
+                        }
+                        
+                        h3 {
+                            color: #1a73e8;
+                            font-size: 20px;
+                            margin: 20px 0 12px 0;
+                            font-weight: 500;
+                        }
+                        
+                        h4 {
+                            color: #5f6368;
+                            font-size: 16px;
+                            margin: 16px 0 8px 0;
+                            font-weight: 600;
+                        }
+                        
+                        p {
+                            margin: 12px 0;
+                            color: #202124;
+                            font-size: 14px;
+                        }
+                        
+                        ul, ol {
+                            margin: 12px 0;
+                            padding-left: 32px;
+                        }
+                        
+                        li {
+                            margin: 8px 0;
+                            color: #202124;
+                            font-size: 14px;
+                        }
+                        
+                        code {
+                            background: #f1f3f4;
+                            padding: 2px 6px;
+                            border-radius: 3px;
+                            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                            font-size: 13px;
+                            color: #c7254e;
+                        }
+                        
+                        pre {
+                            background: #f8f9fa;
+                            padding: 16px;
+                            border-radius: 4px;
+                            overflow-x: auto;
+                            margin: 16px 0;
+                            border: 1px solid #e8eaed;
+                        }
+                        
+                        pre code {
+                            background: transparent;
+                            padding: 0;
+                            color: #202124;
+                            font-size: 13px;
+                        }
+                        
+                        a {
+                            color: #1a73e8;
+                            text-decoration: none;
+                        }
+                        
+                        a:hover {
+                            text-decoration: underline;
+                        }
+                        
+                        table {
+                            width: 100%;
+                            border-collapse: collapse;
+                            margin: 16px 0;
+                            background: #ffffff;
+                        }
+                        
+                        th, td {
+                            padding: 12px;
+                            text-align: left;
+                            border: 1px solid #e8eaed;
+                        }
+                        
+                        th {
+                            background: #f8f9fa;
+                            font-weight: 600;
+                            color: #5f6368;
+                        }
+                        
+                        tr:nth-child(even) {
+                            background: #fafafa;
+                        }
+                        
+                        em {
+                            color: #5f6368;
+                            font-style: italic;
+                        }
+                        
+                        strong, b {
+                            font-weight: 600;
+                            color: #202124;
+                        }
                     </style>
                 </head>
                 <body>
-                    <div style="background: #e3f2fd; padding: 10px; border-radius: 4px; margin-bottom: 15px;">
-                        <b>📄 Documentation:</b> <a href="$url" target="_blank">$url</a>
+                    <div class="source-link">
+                        📄 <strong>Documentation:</strong> <a href="$url" target="_blank">$url</a>
                     </div>
-                    $content
+                    <div class="content">
+                        $content
+                    </div>
                 </body>
                 </html>
             """.trimIndent()
         } catch (e: Exception) {
-            println("=== Error extracting AndroidX content: ${e.message} ===")
-            return "<html><body><p>Error loading AndroidX documentation: ${e.message}</p></body></html>"
+            println("=== Error extracting AndroidX: ${e.message} ===")
+            e.printStackTrace()
+            return buildErrorHtml(url)
         }
+    }
+
+    private fun buildIframeHtml(url: String): String {
+        return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <style>
+                    body { 
+                        margin: 0; 
+                        padding: 0; 
+                        background: #ffffff;
+                    }
+                    .header {
+                        background: #e8f0fe;
+                        padding: 12px 16px;
+                        border-bottom: 1px solid #dadce0;
+                    }
+                    .header a {
+                        color: #1a73e8;
+                        text-decoration: none;
+                        font-family: Arial, sans-serif;
+                        font-size: 14px;
+                    }
+                    iframe { 
+                        width: 100%; 
+                        height: calc(100vh - 50px); 
+                        border: none;
+                        background: #ffffff;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="header">
+                    📄 <strong>External documentation:</strong> <a href="$url" target="_blank">$url</a>
+                </div>
+                <iframe src="$url"></iframe>
+            </body>
+            </html>
+        """.trimIndent()
+    }
+
+    private fun buildErrorHtml(url: String): String {
+        return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <style>
+                    body {
+                        font-family: Arial, sans-serif;
+                        padding: 24px;
+                        background: #ffffff;
+                    }
+                    .error {
+                        background: #ffffff;
+                        padding: 24px;
+                        border-radius: 8px;
+                        border-left: 4px solid #ea4335;
+                        border: 1px solid #f8d7da;
+                    }
+                    h3 {
+                        color: #ea4335;
+                        margin-top: 0;
+                    }
+                    a {
+                        color: #1a73e8;
+                        text-decoration: none;
+                    }
+                    a:hover {
+                        text-decoration: underline;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="error">
+                    <h3>⚠️ Could not load documentation</h3>
+                    <p>Try opening the URL directly: <a href="$url" target="_blank">$url</a></p>
+                </div>
+            </body>
+            </html>
+        """.trimIndent()
     }
 }

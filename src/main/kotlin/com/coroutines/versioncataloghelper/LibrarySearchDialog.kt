@@ -3,12 +3,16 @@ package com.coroutines.versioncataloghelper
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.ui.components.*
+import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ui.table.JBTable
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.catch
 import java.awt.BorderLayout
 import java.awt.Dimension
 import javax.swing.*
+import javax.swing.event.DocumentEvent
+import javax.swing.event.DocumentListener
 import javax.swing.table.DefaultTableModel
-import java.util.concurrent.CompletableFuture
 
 class LibrarySearchDialog(private val project: Project) : DialogWrapper(project) {
 
@@ -19,7 +23,11 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
     private val nameLabel = JBLabel()
     private val versionLabel = JBLabel()
     private val groupLabel = JBLabel()
-    private val descriptionPane = JEditorPane()  // Changed from JTextArea
+    private val browser: JBCefBrowser
+
+    private val scopeJob = SupervisorJob()  // Store the job
+    private val scope = CoroutineScope(Dispatchers.Main + scopeJob)
+    private var searchJob: Job? = null
 
     init {
         title = "Search Maven Repositories"
@@ -39,45 +47,48 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
             }
         }
 
-        // Use JEditorPane for HTML rendering
-        descriptionPane.apply {
-            contentType = "text/html"
-            isEditable = false
-            addHyperlinkListener { e ->
-                if (e.eventType == javax.swing.event.HyperlinkEvent.EventType.ACTIVATED) {
-                    // Open links in browser
-                    java.awt.Desktop.getDesktop().browse(e.url.toURI())
-                }
-            }
-        }
+        browser = JBCefBrowser()
+        browser.loadHTML(getWelcomeHtml())
 
         init()
 
-        // Trigger search on Enter
-        searchField.addActionListener {
-            performSearch()
-        }
+        // Auto-search on typing (with debounce)
+        // Auto-search on typing (with debounce)
+        searchField.document.addDocumentListener(object : DocumentListener {
+            private var debounceTimer: Timer? = null
+
+            override fun insertUpdate(e: DocumentEvent?) = scheduleSearch()
+            override fun removeUpdate(e: DocumentEvent?) = scheduleSearch()
+            override fun changedUpdate(e: DocumentEvent?) = scheduleSearch()
+
+            private fun scheduleSearch() {
+                debounceTimer?.stop()  // Changed from cancel()
+                debounceTimer = Timer(300) {
+                    SwingUtilities.invokeLater {
+                        performSearch()
+                    }
+                }.apply {
+                    isRepeats = false
+                    start()
+                }
+            }
+        })
     }
 
     override fun createCenterPanel(): JComponent {
         val mainPanel = JPanel(BorderLayout())
-        mainPanel.preferredSize = Dimension(1100, 700)
+        mainPanel.preferredSize = Dimension(1200, 750)
 
         // Top: Search panel
         val searchPanel = JPanel(BorderLayout()).apply {
             border = BorderFactory.createEmptyBorder(10, 10, 10, 10)
-            add(JBLabel("Search: "), BorderLayout.WEST)
+            add(JBLabel("Search (min 5 chars): "), BorderLayout.WEST)
             add(searchField, BorderLayout.CENTER)
-
-            val searchButton = JButton("Search").apply {
-                addActionListener { performSearch() }
-            }
-            add(searchButton, BorderLayout.EAST)
         }
 
         // Left: Results list
         val resultsPanel = JBScrollPane(resultsTable).apply {
-            preferredSize = Dimension(450, 600)
+            preferredSize = Dimension(400, 650)
         }
 
         // Right: Details panel
@@ -103,11 +114,11 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
             add(Box.createVerticalStrut(10))
 
             add(JBLabel("Documentation:"))
-            add(JBScrollPane(descriptionPane).apply {
-                preferredSize = Dimension(500, 400)
+            add(browser.component.apply {
+                preferredSize = Dimension(650, 450)
             })
 
-            preferredSize = Dimension(550, 600)
+            preferredSize = Dimension(700, 650)
         }
 
         // Split pane
@@ -116,7 +127,7 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
             resultsPanel,
             detailsPanel
         ).apply {
-            dividerLocation = 450
+            dividerLocation = 400
         }
 
         mainPanel.add(searchPanel, BorderLayout.NORTH)
@@ -127,33 +138,70 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
 
     private fun performSearch() {
         val keyword = searchField.text.trim()
-        if (keyword.isEmpty() || keyword.length < 2) {
+        if (keyword.length < 5) {
+            if (keyword.isEmpty()) {
+                resultsModel.rowCount = 0
+            }
             return
         }
 
-        // Clear current results
+        // Cancel previous search
+        searchJob?.cancel()
+
+        // Clear results and show loading
         resultsModel.rowCount = 0
-        resultsModel.addRow(arrayOf("Searching...", "", ""))
+        resultsModel.addRow(arrayOf("🔍 Searching...", "", ""))
 
-        // Search in background
-        CompletableFuture.supplyAsync {
-            KeywordSearch.searchByKeyword(keyword)
-        }.thenAccept { libraries ->
-            SwingUtilities.invokeLater {
-                resultsModel.rowCount = 0
-
-                if (libraries.isEmpty()) {
-                    resultsModel.addRow(arrayOf("No results found", "", ""))
-                } else {
-                    libraries.forEach { lib ->
-                        resultsModel.addRow(
-                            arrayOf(
-                                lib.artifactId,
-                                lib.latestVersion,
-                                lib.groupId
-                            )
-                        )
+        // Start new search
+        searchJob = scope.launch {
+            try {
+                KeywordSearch.searchByKeywordFlow(keyword)
+                    .catch { e ->
+                        println("=== Flow error: ${e.message} ===")
+                        e.printStackTrace()
                     }
+                    .collect { library ->
+                        withContext(Dispatchers.Main) {
+                            // Remove loading indicator if this is first result
+                            if (resultsModel.rowCount > 0 &&
+                                resultsModel.getValueAt(0, 0) == "🔍 Searching...") {
+                                resultsModel.removeRow(0)
+                            }
+
+                            // Add the new result
+                            resultsModel.addRow(
+                                arrayOf(
+                                    library.artifactId,
+                                    library.latestVersion,
+                                    library.groupId
+                                )
+                            )
+
+                            println("=== Added to UI: ${library.groupId}:${library.artifactId} ===")
+                        }
+                    }
+
+                // After all results, remove loading indicator if still there
+                withContext(Dispatchers.Main) {
+                    if (resultsModel.rowCount > 0 &&
+                        resultsModel.getValueAt(0, 0) == "🔍 Searching...") {
+                        resultsModel.removeRow(0)
+                    }
+
+                    if (resultsModel.rowCount == 0) {
+                        resultsModel.addRow(arrayOf("No results found", "", ""))
+                    }
+                }
+
+            } catch (e: CancellationException) {
+                println("=== Search cancelled ===")
+            } catch (e: Exception) {
+                println("=== Search error: ${e.message} ===")
+                e.printStackTrace()
+
+                withContext(Dispatchers.Main) {
+                    resultsModel.rowCount = 0
+                    resultsModel.addRow(arrayOf("Error: ${e.message}", "", ""))
                 }
             }
         }
@@ -167,37 +215,191 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
         val version = resultsModel.getValueAt(selectedRow, 1) as String
         val group = resultsModel.getValueAt(selectedRow, 2) as String
 
+        // Skip special rows
+        if (name.startsWith("🔍") || name == "No results found" || name.startsWith("Error:")) {
+            return
+        }
+
         nameLabel.text = name
         versionLabel.text = version
         groupLabel.text = group
 
-        // Show loading message
-        descriptionPane.text = "<html><body><p>Loading documentation...</p></body></html>"
+        browser.loadHTML(getLoadingHtml())
 
-        // Fetch metadata in background
-        CompletableFuture.supplyAsync {
-            LibraryMetadataFetcher.fetchMetadata(group, name, version)
-        }.thenAccept { metadata ->
-            SwingUtilities.invokeLater {
-                if (metadata.htmlContent != null) {
-                    descriptionPane.text = metadata.htmlContent
-                    descriptionPane.caretPosition = 0  // Scroll to top
-                } else {
-                    // Fallback to basic info
-                    descriptionPane.text = """
-                        <html>
-                        <body style="font-family: sans-serif; padding: 10px;">
-                            <h3>$group:$name</h3>
-                            <p><b>Version:</b> $version</p>
-                            ${metadata.description?.let { "<p><b>Description:</b> $it</p>" } ?: ""}
-                            ${metadata.url?.let { "<p><b>Project URL:</b> <a href='$it'>$it</a></p>" } ?: ""}
-                            <p><i>No additional documentation available.</i></p>
-                        </body>
-                        </html>
-                    """.trimIndent()
+        scope.launch {
+            try {
+                val metadata = withContext(Dispatchers.IO) {
+                    LibraryMetadataFetcher.fetchMetadata(group, name, version)
                 }
+
+                withContext(Dispatchers.Main) {
+                    if (metadata.htmlContent != null) {
+                        browser.loadHTML(metadata.htmlContent)
+                    } else if (metadata.url != null) {
+                        browser.loadURL(metadata.url)
+                    } else {
+                        browser.loadHTML(getBasicInfoHtml(group, name, version, metadata.description))
+                    }
+                }
+            } catch (e: Exception) {
+                println("=== Error loading metadata: ${e.message} ===")
+                e.printStackTrace()
             }
         }
+    }
+
+    private fun getWelcomeHtml(): String {
+        return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <style>
+                    body {
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+                        padding: 40px;
+                        background: #ffffff;
+                        color: #333;
+                    }
+                    .welcome {
+                        background: #ffffff;
+                        padding: 32px;
+                        border-radius: 8px;
+                        border: 2px solid #e8eaed;
+                    }
+                    h2 {
+                        color: #1a73e8;
+                        margin-top: 0;
+                        font-weight: 500;
+                    }
+                    p {
+                        color: #5f6368;
+                        line-height: 1.6;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="welcome">
+                    <h2>🔍 Maven Repository Search</h2>
+                    <p>Search for libraries and view their documentation.</p>
+                    <p>Type at least 5 characters to start searching.</p>
+                </div>
+            </body>
+            </html>
+        """.trimIndent()
+    }
+
+    private fun getLoadingHtml(): String {
+        return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <style>
+                    body {
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+                        padding: 40px;
+                        background: #ffffff;
+                        display: flex;
+                        justify-content: center;
+                        align-items: center;
+                        min-height: 400px;
+                    }
+                    .loader {
+                        text-align: center;
+                    }
+                    .spinner {
+                        border: 4px solid #e8eaed;
+                        border-top: 4px solid #1a73e8;
+                        border-radius: 50%;
+                        width: 40px;
+                        height: 40px;
+                        animation: spin 1s linear infinite;
+                        margin: 0 auto 20px;
+                    }
+                    @keyframes spin {
+                        0% { transform: rotate(0deg); }
+                        100% { transform: rotate(360deg); }
+                    }
+                    p {
+                        color: #5f6368;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="loader">
+                    <div class="spinner"></div>
+                    <p>Loading documentation...</p>
+                </div>
+            </body>
+            </html>
+        """.trimIndent()
+    }
+
+    private fun getBasicInfoHtml(group: String, artifact: String, version: String, description: String?): String {
+        return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <style>
+                    body {
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+                        padding: 24px;
+                        background: #ffffff;
+                        color: #333;
+                    }
+                    .card {
+                        background: #ffffff;
+                        padding: 24px;
+                        border-radius: 8px;
+                        border: 1px solid #e8eaed;
+                    }
+                    h2 {
+                        color: #1a73e8;
+                        margin-top: 0;
+                        font-weight: 500;
+                    }
+                    .info-row {
+                        margin: 16px 0;
+                    }
+                    .label {
+                        font-weight: 600;
+                        color: #5f6368;
+                        margin-bottom: 4px;
+                    }
+                    .value {
+                        font-family: 'Monaco', 'Courier New', monospace;
+                        background: #f8f9fa;
+                        padding: 8px 12px;
+                        border-radius: 4px;
+                        display: inline-block;
+                        margin-top: 4px;
+                        color: #202124;
+                        border: 1px solid #e8eaed;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <h2>$group:$artifact</h2>
+                    <div class="info-row">
+                        <div class="label">Version:</div>
+                        <div class="value">$version</div>
+                    </div>
+                    ${description?.let { """
+                        <div class="info-row">
+                            <div class="label">Description:</div>
+                            <p>$it</p>
+                        </div>
+                    """ } ?: ""}
+                    <div class="info-row">
+                        <p style="color: #5f6368; font-style: italic;">No additional documentation available.</p>
+                    </div>
+                </div>
+            </body>
+            </html>
+        """.trimIndent()
     }
 
     override fun createActions(): Array<Action> {
@@ -219,8 +421,11 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
         val version = resultsModel.getValueAt(selectedRow, 1) as String
         val groupId = resultsModel.getValueAt(selectedRow, 2) as String
 
-        // TODO: Actually add to libs.versions.toml
-        // For now, just show what would be added
+        // Skip special rows
+        if (artifactId.startsWith("🔍") || artifactId == "No results found" || artifactId.startsWith("Error:")) {
+            return
+        }
+
         val message = """
             Add to libs.versions.toml:
             
@@ -239,5 +444,12 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
         )
 
         close(OK_EXIT_CODE)
+    }
+
+    override fun dispose() {
+        searchJob?.cancel()
+        scope.coroutineContext.cancelChildren()
+        browser.dispose()
+        super.dispose()
     }
 }

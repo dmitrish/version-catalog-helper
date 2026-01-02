@@ -1,5 +1,6 @@
 package com.coroutines.versioncataloghelper
 
+/*
 import com.intellij.codeInsight.completion.*
 import com.intellij.codeInsight.lookup.LookupElementBuilder
 import com.intellij.openapi.application.ApplicationManager
@@ -208,4 +209,4 @@ class TomlVersionCompletionContributor : CompletionContributor() {
         }
         return false
     }
-}
+}*/
