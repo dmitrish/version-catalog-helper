@@ -1,15 +1,38 @@
 <!-- Plugin Configuration File. Read more: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
 <idea-plugin>
-    <id>com.github.dmitrish.versioncataloghelper</id>
+    <id>com.coroutines.versioncataloghelper</id>
     <name>version-catalog-helper</name>
-    <vendor>dmitrish</vendor>
+    <vendor>coroutines.com</vendor>
+
+    <description><![CDATA[
+    Autocomplete and version assistance for Gradle version catalogs (libs.versions.toml).
+
+    <h3>Features:</h3>
+    <ul>
+      <li>Autocomplete available versions from Maven Central</li>
+      <li>Shows latest stable vs preview versions</li>
+      <li>Displays release dates</li>
+      <li>Works with standard version catalog format</li>
+    </ul>
+
+    <h3>Usage:</h3>
+    Start typing a version number in the <code>[versions]</code> section of your
+    <code>libs.versions.toml</code> file and press Ctrl+Space to see available versions.
+    ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
-
-    <resource-bundle>messages.MyBundle</resource-bundle>
+    <depends>org.toml.lang</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <toolWindow factoryClass="com.github.dmitrish.versioncataloghelper.toolWindow.MyToolWindowFactory" id="MyToolWindow"/>
-        <postStartupActivity implementation="com.github.dmitrish.versioncataloghelper.startup.MyProjectActivity" />
-    </extensions>
+        <codeInsight.lineMarkerProvider
+                language="TOML"
+                implementationClass="com.coroutines.versioncataloghelper.VersionCatalogLineMarkerProvider"/>  </extensions>
+
+    <actions>
+        <action id="TestPluginAction"
+                class="com.coroutines.versioncataloghelper.TestAction"
+                text="Test Plugin">
+            <add-to-group group-id="ToolsMenu" anchor="first"/>
+        </action>
+    </actions>
 </idea-plugin>

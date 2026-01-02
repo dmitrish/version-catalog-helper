@@ -1,4 +1,4 @@
-package com.github.dmitrish.versioncataloghelper
+package com.coroutines.versioncataloghelper
 
 import com.intellij.DynamicBundle
 import org.jetbrains.annotations.NonNls
