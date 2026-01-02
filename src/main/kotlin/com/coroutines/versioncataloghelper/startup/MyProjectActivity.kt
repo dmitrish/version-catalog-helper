@@ -1,4 +1,4 @@
-package com.github.dmitrish.versioncataloghelper.startup
+package com.coroutines.versioncataloghelper.startup
 
 import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.openapi.project.Project

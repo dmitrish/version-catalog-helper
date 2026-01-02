@@ -1,4 +1,4 @@
-package com.github.dmitrish.versioncataloghelper.toolWindow
+package com.coroutines.versioncataloghelper.toolWindow
 
 import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.thisLogger
@@ -8,8 +8,8 @@ import com.intellij.openapi.wm.ToolWindowFactory
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPanel
 import com.intellij.ui.content.ContentFactory
-import com.github.dmitrish.versioncataloghelper.MyBundle
-import com.github.dmitrish.versioncataloghelper.services.MyProjectService
+import com.coroutines.versioncataloghelper.MyBundle
+import com.coroutines.versioncataloghelper.services.MyProjectService
 import javax.swing.JButton
 
 
