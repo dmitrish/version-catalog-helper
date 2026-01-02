@@ -18,7 +18,12 @@ object KeywordSearch {
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    fun searchByKeywordFlow(keyword: String): Flow<MavenCentralApi.LibraryInfo> = flow {
+    data class SearchResult(
+        val library: MavenCentralApi.LibraryInfo,
+        val vendor: String
+    )
+
+    fun searchByKeywordFlow(keyword: String): Flow<SearchResult> = flow {
         if (keyword.length < 3) {
             return@flow
         }
@@ -27,55 +32,77 @@ object KeywordSearch {
 
         val emittedIds = mutableSetOf<String>()
 
-        // 1. Search Google Maven and emit results immediately as we find them
+        // PHASE 1: AndroidX/Google libraries
+        println("=== PHASE 1: Google Maven ===")
         val patterns = buildGoogleMavenPatterns(keyword)
-
         for ((groupId, artifactId) in patterns) {
             val lib = tryFetchGoogleMaven(groupId, artifactId)
             if (lib != null) {
                 val id = "${lib.groupId}:${lib.artifactId}"
                 if (!emittedIds.contains(id)) {
                     emittedIds.add(id)
-                    emit(lib)  // Emit immediately!
-                    println("=== Emitted: $id ===")
+                    val vendor = if (lib.groupId.startsWith("androidx.")) "AndroidX" else "Google"
+                    emit(SearchResult(lib, vendor))
                 }
             }
         }
 
-        // 2. Search Maven Central and emit as we find them
-        val mavenResults = withContext(Dispatchers.IO) {
+        // PHASE 2: JetBrains libraries from Maven Central
+        println("=== PHASE 2: JetBrains ===")
+        val allMavenResults = withContext(Dispatchers.IO) {
             searchMavenCentral(keyword)
         }
 
-        val scored = mavenResults.map { lib ->
-            lib to calculateRelevanceScore(lib, keyword)
-        }.sortedByDescending { it.second }
+        val jetbrainsResults = allMavenResults.filter { lib ->
+            lib.groupId.startsWith("org.jetbrains.") ||
+                    lib.groupId.startsWith("com.jetbrains.")
+        }.sortedByDescending { calculateRelevanceScore(it, keyword) }
 
-        scored.forEach { (lib, score) ->
+        jetbrainsResults.forEach { lib ->
             val id = "${lib.groupId}:${lib.artifactId}"
             if (!emittedIds.contains(id)) {
                 emittedIds.add(id)
-                emit(lib)  // Emit immediately!
-                println("=== Emitted: $id (score: $score) ===")
+                println("=== Emitting JetBrains: $id ===")
+                emit(SearchResult(lib, "JetBrains"))
             }
+        }
+
+        // PHASE 3: Other libraries (excluding JetBrains)
+        println("=== PHASE 3: Others ===")
+        val otherResults = allMavenResults
+            .filter { lib ->
+                val id = "${lib.groupId}:${lib.artifactId}"
+                !emittedIds.contains(id) &&
+                        !lib.groupId.startsWith("org.jetbrains.") &&
+                        !lib.groupId.startsWith("com.jetbrains.") &&
+                        !lib.groupId.startsWith("androidx.") &&
+                        !lib.groupId.startsWith("com.google.")
+            }
+            .map { lib -> lib to calculateRelevanceScore(lib, keyword) }
+            .sortedByDescending { it.second }
+
+        otherResults.forEach { (lib, _) ->
+            val id = "${lib.groupId}:${lib.artifactId}"
+            emit(SearchResult(lib, "Other"))
         }
     }
 
     private fun buildGoogleMavenPatterns(keyword: String): List<Pair<String, String>> {
         val patterns = mutableListOf<Pair<String, String>>()
 
+        // Common patterns
         patterns.add("androidx.$keyword" to keyword)
-        patterns.add("androidx.$keyword" to "$keyword-runtime")
-        patterns.add("androidx.$keyword" to "$keyword-ktx")
         patterns.add("androidx.$keyword" to "$keyword-runtime-ktx")
-        patterns.add("androidx.$keyword" to "$keyword-viewmodel")
-        patterns.add("androidx.$keyword" to "$keyword-livedata")
+        patterns.add("androidx.$keyword" to "$keyword-ktx")
+        patterns.add("androidx.$keyword" to "$keyword-runtime")
+        patterns.add("androidx.$keyword" to "$keyword-viewmodel-ktx")
+        patterns.add("androidx.$keyword" to "$keyword-livedata-ktx")
         patterns.add("androidx.$keyword" to "$keyword-common")
         patterns.add("androidx.compose.$keyword" to keyword)
-        patterns.add("androidx.compose.$keyword" to "$keyword-android")
         patterns.add("com.google.android.$keyword" to keyword)
         patterns.add("com.google.$keyword" to keyword)
 
+        // Specific library shortcuts
         when (keyword.lowercase()) {
             "lifecycle" -> {
                 patterns.add(0, "androidx.lifecycle" to "lifecycle-runtime-ktx")
@@ -118,12 +145,8 @@ object KeywordSearch {
                     val latestVersion = extractLatestVersion(body)
 
                     if (latestVersion != null) {
-                        println("=== FOUND on Google Maven: $groupId:$artifactId - $latestVersion ===")
-                        return MavenCentralApi.LibraryInfo(
-                            groupId = groupId,
-                            artifactId = artifactId,
-                            latestVersion = latestVersion
-                        )
+                        println("=== FOUND Google Maven: $groupId:$artifactId - $latestVersion ===")
+                        return MavenCentralApi.LibraryInfo(groupId, artifactId, latestVersion)
                     }
                 }
             }
@@ -136,9 +159,7 @@ object KeywordSearch {
     private fun extractLatestVersion(xml: String): String? {
         var pattern = """<latest>([^<]+)</latest>""".toRegex()
         var match = pattern.find(xml)
-        if (match != null) {
-            return match.groupValues[1]
-        }
+        if (match != null) return match.groupValues[1]
 
         pattern = """<release>([^<]+)</release>""".toRegex()
         match = pattern.find(xml)
@@ -148,29 +169,30 @@ object KeywordSearch {
     private fun searchMavenCentral(keyword: String): List<MavenCentralApi.LibraryInfo> {
         val results = mutableListOf<MavenCentralApi.LibraryInfo>()
 
+        // Search with main keyword
         results.addAll(searchMavenCentralWithQuery(keyword))
 
+        // Also search with androidx prefix if not already included
         if (!keyword.startsWith("androidx.") && !keyword.startsWith("com.google.")) {
             results.addAll(searchMavenCentralWithQuery("androidx.$keyword"))
-            results.addAll(searchMavenCentralWithQuery("com.google.android.$keyword"))
         }
 
-        return results
+        return results.distinctBy { "${it.groupId}:${it.artifactId}" }
     }
 
     private fun searchMavenCentralWithQuery(query: String): List<MavenCentralApi.LibraryInfo> {
         try {
             val url = "https://search.maven.org/solrsearch/select?" +
                     "q=$query&" +
-                    "rows=20&wt=json"
+                    "rows=50&wt=json"
+
+            println("=== Maven Central query: $query ===")
 
             val request = Request.Builder().url(url).build()
             val response = client.newCall(request).execute()
 
             response.use {
-                if (!it.isSuccessful) {
-                    return emptyList()
-                }
+                if (!it.isSuccessful) return emptyList()
 
                 val body = it.body?.string() ?: return emptyList()
                 val result = json.decodeFromString<SearchResponse>(body)
@@ -191,20 +213,26 @@ object KeywordSearch {
         val groupLower = lib.groupId.lowercase()
         val artifactLower = lib.artifactId.lowercase()
 
+        // Exact matches
         if (artifactLower == keywordLower) score += 100
         if (artifactLower.startsWith(keywordLower)) score += 50
         if (artifactLower.contains(keywordLower)) score += 25
         if (groupLower.contains(keywordLower)) score += 20
 
+        // Group matches
         if (groupLower == "androidx.$keywordLower" ||
             groupLower == "com.google.$keywordLower" ||
             groupLower == "com.google.android.$keywordLower") {
             score += 150
         }
 
+        // Vendor bonuses
         if (groupLower.startsWith("androidx.")) score += 30
         if (groupLower.startsWith("com.google.")) score += 20
+        if (groupLower.startsWith("org.jetbrains.")) score += 15
+        if (groupLower.startsWith("com.jetbrains.")) score += 15
 
+        // Penalty for very long names
         if (artifactLower.length > keywordLower.length + 20) score -= 10
 
         return score
