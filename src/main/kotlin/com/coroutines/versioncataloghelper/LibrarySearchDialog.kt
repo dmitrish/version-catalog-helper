@@ -8,8 +8,8 @@ import com.intellij.ui.table.JBTable
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.catch
 import java.awt.BorderLayout
-import java.awt.Component
 import java.awt.Dimension
+import java.awt.Component
 import java.awt.Font
 import javax.swing.*
 import javax.swing.event.DocumentEvent
@@ -19,6 +19,9 @@ import javax.swing.table.DefaultTableModel
 
 class LibrarySearchDialog(private val project: Project) : DialogWrapper(project) {
 
+    private val tabbedPane = JBTabbedPane()
+
+    // Search Tab
     private val searchField = JBTextField()
     private val resultsTable: JBTable
     private val resultsModel: DefaultTableModel
@@ -38,6 +41,14 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
     private var animationFrame = 0
 
     private var currentVendor: String? = null
+
+    // Repositories Tab
+    private val availableReposModel = DefaultListModel<String>()
+    private val selectedReposModel = DefaultListModel<String>()
+    private val availableReposList = JBList(availableReposModel)
+    private val selectedReposList = JBList(selectedReposModel)
+
+    private val settings = RepositorySettings.getInstance(project)
 
     init {
         title = "Search Maven Repositories"
@@ -65,7 +76,6 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
                 ): Component {
                     val cell = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
 
-                    // Check if this is a header row
                     val name = resultsModel.getValueAt(row, 0) as? String ?: ""
                     if (name.startsWith("━━━")) {
                         font = font.deriveFont(Font.BOLD, 13f)
@@ -113,11 +123,30 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
                 }
             }
         })
+
+        // Initialize repository lists
+        loadRepositories()
     }
 
     override fun createCenterPanel(): JComponent {
         val mainPanel = JPanel(BorderLayout())
         mainPanel.preferredSize = Dimension(1200, 750)
+
+        // Tab 1: Search
+        val searchTab = createSearchTab()
+        tabbedPane.addTab("Search Libraries", searchTab)
+
+        // Tab 2: Repositories
+        val repoTab = createRepositoriesTab()
+        tabbedPane.addTab("Repositories", repoTab)
+
+        mainPanel.add(tabbedPane, BorderLayout.CENTER)
+
+        return mainPanel
+    }
+
+    private fun createSearchTab(): JPanel {
+        val searchTab = JPanel(BorderLayout())
 
         // Top: Search panel
         val searchPanel = JPanel(BorderLayout()).apply {
@@ -174,10 +203,112 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
             dividerLocation = 450
         }
 
-        mainPanel.add(searchPanel, BorderLayout.NORTH)
-        mainPanel.add(splitPane, BorderLayout.CENTER)
+        searchTab.add(searchPanel, BorderLayout.NORTH)
+        searchTab.add(splitPane, BorderLayout.CENTER)
 
-        return mainPanel
+        return searchTab
+    }
+
+    private fun createRepositoriesTab(): JPanel {
+        val repoTab = JPanel(BorderLayout())
+        repoTab.border = BorderFactory.createEmptyBorder(20, 20, 20, 20)
+
+        // Title
+        val titleLabel = JBLabel("Configure Maven Repositories").apply {
+            font = font.deriveFont(Font.BOLD, 16f)
+        }
+        repoTab.add(titleLabel, BorderLayout.NORTH)
+
+        // Center: Two lists with buttons
+        val centerPanel = JPanel(BorderLayout())
+        centerPanel.border = BorderFactory.createEmptyBorder(20, 0, 0, 0)
+
+        // Left: Available repositories
+        val availablePanel = JPanel(BorderLayout()).apply {
+            border = BorderFactory.createEmptyBorder(0, 0, 0, 10)
+
+            add(JBLabel("Available Repositories:"), BorderLayout.NORTH)
+            add(JBScrollPane(availableReposList).apply {
+                preferredSize = Dimension(400, 500)
+            }, BorderLayout.CENTER)
+        }
+
+        // Middle: Buttons
+        val buttonsPanel = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            border = BorderFactory.createEmptyBorder(50, 10, 0, 10)
+
+            val addButton = JButton("Add →").apply {
+                addActionListener { addRepository() }
+                maximumSize = Dimension(100, 30)
+            }
+
+            val removeButton = JButton("← Remove").apply {
+                addActionListener { removeRepository() }
+                maximumSize = Dimension(100, 30)
+            }
+
+            add(addButton)
+            add(Box.createVerticalStrut(10))
+            add(removeButton)
+        }
+
+        // Right: Selected repositories
+        val selectedPanel = JPanel(BorderLayout()).apply {
+            border = BorderFactory.createEmptyBorder(0, 10, 0, 0)
+
+            add(JBLabel("Selected Repositories:"), BorderLayout.NORTH)
+            add(JBScrollPane(selectedReposList).apply {
+                preferredSize = Dimension(400, 500)
+            }, BorderLayout.CENTER)
+        }
+
+        // Combine
+        val listsPanel = JPanel(BorderLayout())
+        listsPanel.add(availablePanel, BorderLayout.WEST)
+        listsPanel.add(buttonsPanel, BorderLayout.CENTER)
+        listsPanel.add(selectedPanel, BorderLayout.EAST)
+
+        centerPanel.add(listsPanel, BorderLayout.CENTER)
+
+        // Info label
+        val infoLabel = JBLabel("Changes are saved automatically").apply {
+            font = font.deriveFont(Font.ITALIC, 11f)
+        }
+        centerPanel.add(infoLabel, BorderLayout.SOUTH)
+
+        repoTab.add(centerPanel, BorderLayout.CENTER)
+
+        return repoTab
+    }
+
+    private fun loadRepositories() {
+        val enabled = settings.getEnabledRepositories()
+        val available = RepositorySettings.AVAILABLE_REPOSITORIES
+
+        selectedReposModel.clear()
+        availableReposModel.clear()
+
+        enabled.forEach { selectedReposModel.addElement(it) }
+        available.filter { !enabled.contains(it) }.forEach { availableReposModel.addElement(it) }
+    }
+
+    private fun addRepository() {
+        val selected = availableReposList.selectedValue ?: return
+
+        availableReposModel.removeElement(selected)
+        selectedReposModel.addElement(selected)
+
+        settings.setRepositoryEnabled(selected, true)
+    }
+
+    private fun removeRepository() {
+        val selected = selectedReposList.selectedValue ?: return
+
+        selectedReposModel.removeElement(selected)
+        availableReposModel.addElement(selected)
+
+        settings.setRepositoryEnabled(selected, false)
     }
 
     private fun startLoadingAnimation() {
@@ -210,15 +341,12 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
             return
         }
 
-        // Cancel previous search
         searchJob?.cancel()
 
-        // Clear results and start animation
         resultsModel.rowCount = 0
         currentVendor = null
         startLoadingAnimation()
 
-        // Start new search with streaming results
         searchJob = scope.launch(Dispatchers.IO) {
             try {
                 KeywordSearch.searchByKeywordFlow(keyword)
@@ -228,7 +356,6 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
                     }
                     .collect { result ->
                         withContext(Dispatchers.Main) {
-                            // Add vendor header if vendor changed
                             if (currentVendor != result.vendor) {
                                 currentVendor = result.vendor
                                 resultsModel.addRow(
@@ -236,7 +363,6 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
                                 )
                             }
 
-                            // Add the library
                             resultsModel.addRow(
                                 arrayOf(
                                     result.library.artifactId,
@@ -244,12 +370,9 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
                                     result.library.groupId
                                 )
                             )
-
-                            println("=== Added: ${result.library.groupId}:${result.library.artifactId} ===")
                         }
                     }
 
-                // Search complete
                 withContext(Dispatchers.Main) {
                     stopLoadingAnimation()
 
@@ -284,7 +407,6 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
         val version = resultsModel.getValueAt(selectedRow, 1) as String
         val group = resultsModel.getValueAt(selectedRow, 2) as String
 
-        // Skip special rows (headers, no results, errors)
         if (name.startsWith("━━━") || name == "No results found" || name.startsWith("Error:")) {
             return
         }
@@ -490,7 +612,6 @@ class LibrarySearchDialog(private val project: Project) : DialogWrapper(project)
         val version = resultsModel.getValueAt(selectedRow, 1) as String
         val groupId = resultsModel.getValueAt(selectedRow, 2) as String
 
-        // Skip special rows
         if (artifactId.startsWith("━━━") || artifactId == "No results found" || artifactId.startsWith("Error:")) {
             return
         }

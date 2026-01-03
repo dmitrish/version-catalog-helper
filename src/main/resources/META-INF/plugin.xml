@@ -26,7 +26,10 @@
     <extensions defaultExtensionNs="com.intellij">
         <codeInsight.lineMarkerProvider
                 language="TOML"
-                implementationClass="com.coroutines.versioncataloghelper.VersionCatalogLineMarkerProvider"/>  </extensions>
+                implementationClass="com.coroutines.versioncataloghelper.VersionCatalogLineMarkerProvider"/>
+        <projectService
+                serviceImplementation="com.coroutines.versioncataloghelper.RepositorySettings"/>
+    </extensions>
 
     <actions>
         <action id="TestPluginAction"
