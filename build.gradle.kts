@@ -34,7 +34,7 @@ repositories {
 dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.0")
-    implementation("org.jsoup:jsoup:1.17.2")  // Add this
+    implementation("org.jsoup:jsoup:1.22.1")  // Add this
 
     testImplementation(libs.junit)
     testImplementation(libs.opentest4j)
